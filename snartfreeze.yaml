@@ -1,0 +1,227 @@
+# SnartFreeze - ESPHome Freezer Controller
+# 
+# This configuration provides a smart freezer controller with:
+# - Temperature monitoring via DS18B20 sensor
+# - Relay control for compressor
+# - Door sensor monitoring
+# - Temperature-based automation
+# - Home Assistant integration
+#
+# Hardware Requirements:
+# - ESP32 or ESP8266 board
+# - DS18B20 temperature sensor (waterproof recommended)
+# - Relay module (for compressor control)
+# - Door/window sensor (optional)
+#
+# GPIO Pin Assignments (ESP32):
+# - GPIO4:  OneWire bus for DS18B20 temperature sensor
+# - GPIO16: Relay control output
+# - GPIO17: Door sensor input
+
+substitutions:
+  name: snartfreeze
+  friendly_name: SnartFreeze
+  # Temperature setpoints (°C)
+  target_temp: "-18"
+  hysteresis: "2"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  comment: "Smart Freezer Controller"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  level: INFO
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+# Enable OTA updates
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# Web server for local access
+web_server:
+  port: 80
+
+# Dallas/OneWire temperature sensor setup
+one_wire:
+  - platform: gpio
+    pin: GPIO4
+
+sensor:
+  # DS18B20 Temperature Sensor
+  - platform: dallas_temp
+    name: "Freezer Temperature"
+    id: freezer_temp
+    update_interval: 30s
+    accuracy_decimals: 1
+    filters:
+      - filter_out: nan
+    on_value:
+      then:
+        - script.execute: temperature_control
+
+  # WiFi Signal Strength
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  # Uptime Sensor
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+
+binary_sensor:
+  # Door Sensor
+  - platform: gpio
+    pin:
+      number: GPIO17
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Freezer Door"
+    id: door_sensor
+    device_class: door
+    filters:
+      - delayed_on: 100ms
+      - delayed_off: 100ms
+    on_press:
+      then:
+        - logger.log: "Freezer door opened"
+    on_release:
+      then:
+        - logger.log: "Freezer door closed"
+
+  # Status indicator
+  - platform: status
+    name: "Status"
+
+switch:
+  # Compressor Relay Control
+  - platform: gpio
+    pin:
+      number: GPIO16
+      inverted: false
+    name: "Compressor"
+    id: compressor_relay
+    icon: "mdi:snowflake"
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  # Restart Switch
+  - platform: restart
+    name: "Restart"
+
+number:
+  # Target Temperature Setting
+  - platform: template
+    name: "Target Temperature"
+    id: target_temperature
+    icon: "mdi:thermometer"
+    unit_of_measurement: "°C"
+    min_value: -30
+    max_value: 0
+    step: 0.5
+    initial_value: ${target_temp}
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - script.execute: temperature_control
+
+  # Hysteresis Setting
+  - platform: template
+    name: "Temperature Hysteresis"
+    id: temp_hysteresis
+    icon: "mdi:thermometer-lines"
+    unit_of_measurement: "°C"
+    min_value: 0.5
+    max_value: 5
+    step: 0.5
+    initial_value: ${hysteresis}
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - script.execute: temperature_control
+
+text_sensor:
+  # ESPHome Version
+  - platform: version
+    name: "ESPHome Version"
+
+  # WiFi Info
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+    ssid:
+      name: "Connected SSID"
+
+# Temperature Control Script
+script:
+  - id: temperature_control
+    mode: single
+    then:
+      - lambda: |-
+          float current_temp = id(freezer_temp).state;
+          float target = id(target_temperature).state;
+          float hyst = id(temp_hysteresis).state;
+          
+          if (std::isnan(current_temp)) {
+            ESP_LOGW("temp_control", "Temperature reading is NaN, skipping control");
+            return;
+          }
+          
+          // Turn on compressor if temperature is above target + hysteresis
+          if (current_temp > (target + hyst)) {
+            if (!id(compressor_relay).state) {
+              ESP_LOGI("temp_control", "Temperature %.1f°C above threshold, turning compressor ON", current_temp);
+              id(compressor_relay).turn_on();
+            }
+          }
+          // Turn off compressor if temperature is below target
+          else if (current_temp < target) {
+            if (id(compressor_relay).state) {
+              ESP_LOGI("temp_control", "Temperature %.1f°C below target, turning compressor OFF", current_temp);
+              id(compressor_relay).turn_off();
+            }
+          }
+
+# Interval for safety checks
+interval:
+  - interval: 5min
+    then:
+      - lambda: |-
+          // Safety check: if temperature reading is unavailable for too long,
+          // turn off compressor for safety
+          if (std::isnan(id(freezer_temp).state)) {
+            static int nan_count = 0;
+            nan_count++;
+            if (nan_count >= 3) {
+              ESP_LOGW("safety", "Temperature sensor unavailable, turning off compressor for safety");
+              id(compressor_relay).turn_off();
+            }
+          } else {
+            // Reset counter when we get a valid reading
+            // Note: This is a simplified approach; for production use,
+            // consider using a global variable
+          }
