@@ -1,0 +1,2 @@
+# SnartFreeze
+ESPhome freezer controller
