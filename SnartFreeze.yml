@@ -1,0 +1,280 @@
+esphome:
+  name: fryser
+  friendly_name: Fryser
+
+# Remember to change encryption keys and passwords!
+# Remnber to set wifi_ssid and wifi_password in secrets.yaml
+# Also adjust sensor addresses as needed.
+# This configuration controls a freezer with superfreeze mode and compressor logic.
+# Uses two Dallas temperature sensors and an SSD1306 display.
+# GPIO pins may need adjustment based on your wiring.
+# Ensure minimum ON/OFF times for compressor to protect hardware.
+# Superfreeze mode can be toggled via button or Home Assistant.
+# Superfreeze auto-times out after 3 hours to prevent over-freezing.
+# Compressor forced cooldown (5 min) after long runs (30 min) to prevent overheating.
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "APIEncryptionKeyYouNeedToChange"
+
+ota:
+  - platform: esphome
+    password: "thisyouneedtoputasecretpassword"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Fryser Fallback Hotspot"
+    password: "passwordfallback"
+
+i2c:
+  sda: GPIO6
+  scl: GPIO5
+  scan: true
+  id: i2c_display
+
+one_wire:
+  - platform: gpio
+    pin: GPIO10
+
+number:
+  - platform: template
+    name: "Freezer Target Temp"
+    id: target_temp
+    min_value: -30
+    max_value: 30
+    step: 1
+    initial_value: -18
+    optimistic: true
+
+switch:
+  - platform: template
+    name: "Superfreeze Mode"
+    id: superfreeze
+    optimistic: true
+    turn_on_action:
+      - lambda: |-
+          // Record when superfreeze starts, force compressor ON, and disallow early stop
+          id(superfreeze_start_time) = millis() / 1000;
+          id(compressor_ready_to_stop) = false;
+          if (!id(compressor_relay).state) {
+            id(compressor_start_time) = millis() / 1000;
+            id(compressor_relay).turn_on();
+          }
+    turn_off_action:
+      - lambda: |-
+          // Allow stopping after minimum runtime
+          id(compressor_ready_to_stop) = true;
+      - script.execute: compressor_control
+
+  - platform: gpio
+    pin: GPIO4
+    id: compressor_relay
+    restore_mode: ALWAYS_OFF
+
+binary_sensor:
+  - platform: gpio
+    name: "Temp Up Button"
+    pin:
+      number: GPIO3
+      mode: INPUT_PULLUP
+    on_press:
+      then:
+        - number.increment: target_temp
+
+  - platform: gpio
+    name: "Temp Down Button"
+    pin:
+      number: GPIO1
+      mode: INPUT_PULLUP
+    on_press:
+      then:
+        - number.decrement: target_temp
+
+  - platform: gpio
+    name: "Superfreeze Button"
+    pin:
+      number: GPIO2
+      mode: INPUT_PULLUP
+    on_press:
+      then:
+        - switch.toggle: superfreeze
+
+sensor:
+  - platform: dallas_temp
+    
+    address: 0x203ce10457cb0028
+    name: "Freezer Temperature 1"
+    id: freezer_temp1
+    update_interval: 10s
+    on_value:
+      then:
+        - script.execute: compressor_control
+
+  - platform: dallas_temp
+    
+    address: 0xf63ce10457fea428
+    name: "Freezer Temperature 2"
+    id: freezer_temp2
+    update_interval: 10s
+    on_value:
+      then:
+        - script.execute: compressor_control
+
+
+  
+
+font:
+  - id: roboto_large
+    file: "gfonts://Roboto"
+    size: 20
+
+  - id: roboto_small
+    file: "gfonts://Roboto"
+    size: 14
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    id: freezer_display
+    lambda: |-
+      it.printf(0, 0, id(roboto_small), " %.1f°C", id(freezer_temp1).state);
+      it.printf(64, 0, id(roboto_small), " %.1f°C", id(freezer_temp2).state);
+      it.printf(0, 20, id(roboto_small), "Target: %.0f°C", id(target_temp).state);
+      if (id(superfreeze).state) {
+        it.printf(0, 40, id(roboto_small), "Super: ON");
+      } else {
+        it.printf(0, 40, id(roboto_small), "Super: OFF");
+      }
+      it.printf(64, 40, id(roboto_small), "Comp: %s", id(compressor_relay).state ? "ON" : "OFF");
+
+globals:
+  - id: compressor_start_time
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: compressor_ready_to_stop
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: compressor_force_cooldown
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: superfreeze_start_time
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: compressor_stop_time
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: superfreeze_max_duration
+    type: int
+    restore_value: no
+    initial_value: '10800' # 12 hours in seconds
+    
+script:
+  - id: compressor_control
+    mode: restart
+    then:
+      - lambda: |-
+          // Read sensors
+          float t1 = id(freezer_temp1).state;
+          float t2 = id(freezer_temp2).state;
+          float target = id(target_temp).state;
+          bool is_on = id(compressor_relay).state;
+
+          // Sensor validation
+          if (isnan(t1) && isnan(t2)) return; // no valid sensors
+          // Determine warmest and coldest valid readings
+          float warmest;
+          float coldest;
+          if (isnan(t1)) {
+            warmest = t2;
+            coldest = t2;
+          } else if (isnan(t2)) {
+            warmest = t1;
+            coldest = t1;
+          } else {
+            warmest = t1 > t2 ? t1 : t2;
+            coldest = t1 < t2 ? t1 : t2;
+          }
+
+          // Respect forced cooldown state
+          if (id(compressor_force_cooldown)) return;
+
+          // Handle Superfreeze: keep compressor ON and optionally auto-timeout
+          if (id(superfreeze).state) {
+            // Auto-timeout superfreeze after configured duration
+            int now_s = millis() / 1000;
+            if (id(superfreeze_start_time) > 0 && (now_s - id(superfreeze_start_time)) >= id(superfreeze_max_duration)) {
+              // Turn off superfreeze and proceed to normal control
+              id(superfreeze).turn_off();
+            } else {
+              // Ensure compressor is ON during superfreeze
+              if (!is_on) {
+                // Enforce minimum OFF time before starting
+                int since_stop = now_s - id(compressor_stop_time);
+                if (since_stop >= 120) { // min OFF 120s
+                  id(compressor_relay).turn_on();
+                  id(compressor_start_time) = now_s;
+                  id(compressor_ready_to_stop) = false;
+                }
+              }
+              // Skip OFF logic while superfreeze is active
+              return;
+            }
+          }
+
+          int now_s = millis() / 1000;
+
+          // Turn ON logic using warmest sensor and minimum OFF time
+          if (!is_on) {
+            int since_stop = now_s - id(compressor_stop_time);
+            if (warmest >= target + 2 && since_stop >= 120) { // ON at target+2, min OFF 120s
+              id(compressor_relay).turn_on();
+              id(compressor_ready_to_stop) = false;
+              id(compressor_start_time) = now_s;
+              return;
+            }
+          }
+
+          // Turn OFF logic using coldest sensor and minimum ON time
+          if (is_on) {
+            int runtime = now_s - id(compressor_start_time);
+            if (coldest <= target - 2 && runtime >= 120) { // OFF at target-2, min ON 120s
+              id(compressor_relay).turn_off();
+              id(compressor_ready_to_stop) = false;
+              id(compressor_stop_time) = now_s;
+
+              // If extremely long runs happen, trigger cooldown
+              if (runtime >= 1800) {
+                id(compressor_force_cooldown) = true;
+                id(cooldown_timer).execute();
+              }
+            }
+          }
+
+  - id: cooldown_timer
+    mode: restart
+    then:
+      - delay: 5min
+      - lambda: 'id(compressor_force_cooldown) = false;'
+
+
