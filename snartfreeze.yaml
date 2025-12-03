@@ -206,6 +206,13 @@ script:
             }
           }
 
+# Global variables for safety tracking
+globals:
+  - id: sensor_fail_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+
 # Interval for safety checks
 interval:
   - interval: 5min
@@ -214,14 +221,12 @@ interval:
           // Safety check: if temperature reading is unavailable for too long,
           // turn off compressor for safety
           if (std::isnan(id(freezer_temp).state)) {
-            static int nan_count = 0;
-            nan_count++;
-            if (nan_count >= 3) {
+            id(sensor_fail_count) += 1;
+            if (id(sensor_fail_count) >= 3) {
               ESP_LOGW("safety", "Temperature sensor unavailable, turning off compressor for safety");
               id(compressor_relay).turn_off();
             }
           } else {
             // Reset counter when we get a valid reading
-            // Note: This is a simplified approach; for production use,
-            // consider using a global variable
+            id(sensor_fail_count) = 0;
           }
